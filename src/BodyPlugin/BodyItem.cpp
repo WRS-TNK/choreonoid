@@ -27,9 +27,12 @@
 #include <cnoid/BodyState>
 #include <cnoid/InverseKinematics>
 #include <cnoid/CompositeIK>
+#include <cnoid/CompositeBodyIK>
 #include <cnoid/PinDragIK>
 #include <cnoid/PenetrationBlocker>
 #include <cnoid/FileUtil>
+#include <cnoid/EigenArchive>
+#include <fmt/format.h>
 #include <bitset>
 #include <deque>
 #include <iostream>
@@ -37,10 +40,8 @@
 #include "gettext.h"
 
 using namespace std;
-using namespace std::placeholders;
 using namespace cnoid;
-
-using boost::format;
+using fmt::format;
 
 namespace {
 
@@ -49,50 +50,35 @@ const bool TRACE_FUNCTIONS = false;
 BodyLoader bodyLoader;
 BodyState kinematicStateCopy;
 
-/// \todo move this to hrpUtil ?
-inline double radian(double deg) { return (3.14159265358979 * deg / 180.0); }
+struct AttachmentInfo {
+    string category;
+    Link* link;
+    Position T;
+};
 
-bool loadBodyItem(BodyItem* item, const std::string& filename)
+struct Attachment {
+    BodyItem* baseBodyItem;
+    Link* baseLink;
+    Position T_base_local;
+    Position T_local;
+    bool isBaseKinematicStateChangedNotificationReqruied;
+    string category;
+    ScopedConnection connection;
+};
+
+class MyCompositeBodyIK : public CompositeBodyIK
 {
-    if(item->loadModelFile(filename)){
-        if(item->name().empty()){
-            item->setName(item->body()->modelName());
-        }
-        item->setEditable(!item->body()->isStaticModel());
-        return true;
-    }
-    return false;
-}
-    
-void onSigOptionsParsed(boost::program_options::variables_map& variables)
-{
-    if(variables.count("hrpmodel")){
-        vector<string> modelFileNames = variables["hrpmodel"].as< vector<string> >();
-        for(size_t i=0; i < modelFileNames.size(); ++i){
-            BodyItemPtr item(new BodyItem());
-            if(item->load(modelFileNames[i], "OpenHRP-VRML-MODEL")){
-                RootItem::mainInstance()->addChildItem(item);
-            }
-        }
-    }
-    else if(variables.count("body")){
-    	vector<string> bodyFileNames = variables["body"].as<vector<string>>();
-    	for(size_t i=0; i < bodyFileNames.size(); ++i){
-    		BodyItemPtr item(new BodyItem());
-    		if(item->load(bodyFileNames[i], "OpenHRP-VRML-MODEL")){
-    			RootItem::mainInstance()->addChildItem(item);
-    		}
-    	}
-    }
-}
+public:
+    MyCompositeBodyIK(BodyItemImpl* bodyItemImpl);
+    virtual bool calcInverseKinematics(const Position& T) override;
+    virtual std::shared_ptr<InverseKinematics> getParentBodyIK() override;
 
-double getCurrentTime()
-{
-    return TimeBar::instance()->time();
-}
+    BodyItemImpl* bodyItemImpl;
+    unique_ptr<Attachment>& attachment;
+    shared_ptr<InverseKinematics> baseIK;
+};
 
 }
-
 
 namespace cnoid {
 
@@ -101,18 +87,16 @@ class BodyItemImpl
 public:
     BodyItem* self;
     BodyPtr body;
-    LeggedBodyHelperPtr legged;
-    Vector3 zmp;
     
     enum { UF_POSITIONS, UF_VELOCITIES, UF_ACCELERATIONS, UF_CM, UF_ZMP, NUM_UPUDATE_FLAGS };
     std::bitset<NUM_UPUDATE_FLAGS> updateFlags;
 
-    LazySignal< Signal<void()> > sigKinematicStateChanged;
-    LazySignal< Signal<void()> > sigKinematicStateEdited;
+    LazySignal<Signal<void()>> sigKinematicStateChanged;
+    LazySignal<Signal<void()>> sigKinematicStateEdited;
 
     LinkPtr currentBaseLink;
     LinkTraverse fkTraverse;
-    PinDragIKptr pinDragIK;
+    shared_ptr<PinDragIK> pinDragIK;
 
     bool isEditable;
     bool isCallingSlotsOnKinematicStateEdited;
@@ -137,42 +121,87 @@ public:
 
     Signal<void()> sigModelUpdated;
 
+    unique_ptr<Attachment> attachment;
+
+    LeggedBodyHelperPtr legged;
+    Vector3 zmp;
+
     BodyItemImpl(BodyItem* self);
     BodyItemImpl(BodyItem* self, const BodyItemImpl& org);
+    BodyItemImpl(BodyItem* self, Body* body);
     ~BodyItemImpl();
-        
     void init(bool calledFromCopyConstructor);
     void initBody(bool calledFromCopyConstructor);
     bool loadModelFile(const std::string& filename);
+    void setBody(Body* body);
     void setCurrentBaseLink(Link* link);
+    void appendKinematicStateToHistory();
+    bool undoKinematicState();
+    bool redoKinematicState();
+    void getCurrentIK(Link* targetLink, shared_ptr<InverseKinematics>& ik);
+    void getDefaultIK(Link* targetLink, shared_ptr<InverseKinematics>& ik);
+    void createPenetrationBlocker(Link* link, bool excludeSelfCollisions, shared_ptr<PenetrationBlocker>& blocker);
+    void setPresetPose(BodyItem::PresetPoseID id);
+    bool doLegIkToMoveCm(const Vector3& c, bool onlyProjectionToFloor);
+    bool setStance(double width);
+    void getParticularPosition(BodyItem::PositionType position, stdx::optional<Vector3>& pos);
+    void notifyKinematicStateChange(bool requestFK, bool requestVelFK, bool requestAccFK, bool isDirect);
     void emitSigKinematicStateChanged();
     void emitSigKinematicStateEdited();
     bool enableCollisionDetection(bool on);
     bool enableSelfCollisionDetection(bool on);
     void updateCollisionDetectorLater();
-    void appendKinematicStateToHistory();
+    void doAssign(Item* srcItem);
     bool onStaticModelPropertyChanged(bool on);
     void createSceneBody();
-    void onPositionChanged();
-    bool undoKinematicState();
-    bool redoKinematicState();
-    void getCurrentIK(Link* targetLink, InverseKinematicsPtr& ik);
-    void getDefaultIK(Link* targetLink, InverseKinematicsPtr& ik);
-    void createPenetrationBlocker(Link* link, bool excludeSelfCollisions, PenetrationBlockerPtr& blocker);
-    void setPresetPose(BodyItem::PresetPoseID id);
-    bool doLegIkToMoveCm(const Vector3& c, bool onlyProjectionToFloor);
-    bool setStance(double width);
-    void getParticularPosition(BodyItem::PositionType position, boost::optional<Vector3>& pos);
-    void doAssign(Item* srcItem);
     bool onEditableChanged(bool on);
+    void tryToAttachToBodyItem(BodyItem* bodyItem);
+    bool attachToBodyItem(BodyItem* bodyItem, const AttachmentInfo& baseInfo, const AttachmentInfo& info);
+    void clearAttachment();
+    void onBaseBodyKinematicStateChanged();
     void doPutProperties(PutPropertyFunction& putProperty);
     bool store(Archive& archive);
     bool restore(const Archive& archive);
-    void setBody(Body* body);
 };
 
 }
+
+
+static bool loadBodyItem(BodyItem* item, const std::string& filename)
+{
+    if(item->loadModelFile(filename)){
+        if(item->name().empty()){
+            item->setName(item->body()->modelName());
+        }
+        item->setEditable(!item->body()->isStaticModel());
+        return true;
+    }
+    return false;
+}
     
+
+static void onSigOptionsParsed(boost::program_options::variables_map& variables)
+{
+    if(variables.count("hrpmodel")){
+        vector<string> modelFileNames = variables["hrpmodel"].as< vector<string> >();
+        for(size_t i=0; i < modelFileNames.size(); ++i){
+            BodyItemPtr item(new BodyItem());
+            if(item->load(modelFileNames[i], "OpenHRP-VRML-MODEL")){
+                RootItem::mainInstance()->addChildItem(item);
+            }
+        }
+    }
+    else if(variables.count("body")){
+    	vector<string> bodyFileNames = variables["body"].as<vector<string>>();
+    	for(size_t i=0; i < bodyFileNames.size(); ++i){
+    		BodyItemPtr item(new BodyItem());
+    		if(item->load(bodyFileNames[i], "OpenHRP-VRML-MODEL")){
+    			RootItem::mainInstance()->addChildItem(item);
+    		}
+    	}
+    }
+}
+
 
 void BodyItem::initializeClass(ExtensionManager* ext)
 {
@@ -182,7 +211,9 @@ void BodyItem::initializeClass(ExtensionManager* ext)
         ItemManager& im = ext->itemManager();
         im.registerClass<BodyItem>(N_("BodyItem"));
         im.addLoader<BodyItem>(
-            _("Body"), "OpenHRP-VRML-MODEL", "body;scen;wrl;yaml;yml;dae;stl", std::bind(loadBodyItem, _1, _2));
+            _("Body"), "OpenHRP-VRML-MODEL", "body;scen;wrl;yaml;yml;dae;stl",
+            [](BodyItem* item, const std::string& filename, std::ostream&, Item*){
+                return loadBodyItem(item, filename); });
 
         OptionManager& om = ext->optionManager();
         om.addOption("hrpmodel", boost::program_options::value< vector<string> >(), "load an OpenHRP model file");
@@ -202,11 +233,8 @@ BodyItem::BodyItem()
     
 
 BodyItemImpl::BodyItemImpl(BodyItem* self)
-    : self(self),
-      sigKinematicStateChanged(std::bind(&BodyItemImpl::emitSigKinematicStateChanged, this)),
-      sigKinematicStateEdited(std::bind(&BodyItemImpl::emitSigKinematicStateEdited, this))
+    : BodyItemImpl(self, new Body)
 {
-    body = new Body();
     isEditable = true;
     isCollisionDetectionEnabled = true;
     isSelfCollisionDetectionEnabled = false;
@@ -222,11 +250,7 @@ BodyItem::BodyItem(const BodyItem& org)
 
 
 BodyItemImpl::BodyItemImpl(BodyItem* self, const BodyItemImpl& org)
-    : self(self),
-      body(org.body->clone()),
-      sigKinematicStateChanged(std::bind(&BodyItemImpl::emitSigKinematicStateChanged, this)),
-      sigKinematicStateEdited(std::bind(&BodyItemImpl::emitSigKinematicStateEdited, this)),
-      initialState(org.initialState)
+    : BodyItemImpl(self, org.body->clone())
 {
     if(org.currentBaseLink){
         setCurrentBaseLink(body->link(org.currentBaseLink->index()));
@@ -236,6 +260,30 @@ BodyItemImpl::BodyItemImpl(BodyItem* self, const BodyItemImpl& org)
     isOriginalModelStatic = org.isOriginalModelStatic;
     isCollisionDetectionEnabled = org.isCollisionDetectionEnabled;
     isSelfCollisionDetectionEnabled = org.isSelfCollisionDetectionEnabled;
+
+    initialState = org.initialState;
+}
+
+
+BodyItemImpl::BodyItemImpl(BodyItem* self, Body* body)
+    : self(self),
+      body(body),
+      sigKinematicStateChanged([&](){ emitSigKinematicStateChanged(); }),
+      sigKinematicStateEdited([&](){ emitSigKinematicStateEdited(); })
+{
+
+}
+
+
+BodyItem::~BodyItem()
+{
+    delete impl;
+}
+
+
+BodyItemImpl::~BodyItemImpl()
+{
+
 }
 
 
@@ -251,8 +299,6 @@ void BodyItemImpl::init(bool calledFromCopyConstructor)
     isCallingSlotsOnKinematicStateEdited = false;
 
     initBody(calledFromCopyConstructor);
-
-    self->sigPositionChanged().connect(std::bind(&BodyItemImpl::onPositionChanged, this));
 }
 
 
@@ -274,18 +320,6 @@ void BodyItemImpl::initBody(bool calledFromCopyConstructor)
         zmp.setZero();
         self->storeInitialState();
     }
-}
-
-
-BodyItem::~BodyItem()
-{
-    delete impl;
-}
-
-
-BodyItemImpl::~BodyItemImpl()
-{
-
 }
 
 
@@ -322,15 +356,6 @@ SignalProxy<void()> BodyItem::sigKinematicStateEdited()
 }
 
 
-void BodyItemImpl::onPositionChanged()
-{
-    WorldItem* worldItem = self->findOwnerItem<WorldItem>();
-    if(!worldItem){
-        self->clearCollisions();
-    }
-}
-
-
 bool BodyItem::loadModelFile(const std::string& filename)
 {
     return impl->loadModelFile(filename);
@@ -339,20 +364,21 @@ bool BodyItem::loadModelFile(const std::string& filename)
 
 bool BodyItemImpl::loadModelFile(const std::string& filename)
 {
-    bodyLoader.setMessageSink(mvout(true));
+    bodyLoader.setMessageSink(MessageView::instance()->cout());
 
-    BodyPtr newBody = bodyLoader.load(filename);
+    BodyPtr newBody = new Body;
+    newBody->setName(self->name());
 
-    if(newBody){
+    bool loaded = bodyLoader.load(newBody, filename);
+    if(loaded){
         body = newBody;
-        body->setName(self->name());
         body->initializePosition();
-        body->setCurrentTimeFunction(getCurrentTime);
+        body->setCurrentTimeFunction([](){ return TimeBar::instance()->time(); });
     }
 
     initBody(false);
 
-    return (newBody);
+    return loaded;
 }
 
 
@@ -496,18 +522,6 @@ void BodyItem::beginKinematicStateEdit()
 }
 
 
-void BodyItem::acceptKinematicStateEdit()
-{
-    if(TRACE_FUNCTIONS){
-        cout << "BodyItem::acceptKinematicStateEdit()" << endl;
-    }
-
-    //appendKinematicStateToHistory();
-    impl->needToAppendKinematicStateToHistory = true;
-    impl->sigKinematicStateEdited.request();
-}
-
-
 void BodyItemImpl::appendKinematicStateToHistory()
 {
     if(TRACE_FUNCTIONS){
@@ -532,6 +546,35 @@ void BodyItemImpl::appendKinematicStateToHistory()
     }
 
     isCurrentKinematicStateInHistory = true;
+}
+
+
+void BodyItem::cancelKinematicStateEdit()
+{
+    if(TRACE_FUNCTIONS){
+        cout << "BodyItem::cancelKinematicStateEdit()" << endl;
+    }
+
+    if(impl->isCurrentKinematicStateInHistory){
+        restoreKinematicState(*impl->kinematicStateHistory[impl->currentHistoryIndex]);
+        impl->kinematicStateHistory.pop_back();
+        if(impl->currentHistoryIndex > 0){
+            --impl->currentHistoryIndex;
+        }
+        impl->isCurrentKinematicStateInHistory = false;
+    }
+}
+        
+
+void BodyItem::acceptKinematicStateEdit()
+{
+    if(TRACE_FUNCTIONS){
+        cout << "BodyItem::acceptKinematicStateEdit()" << endl;
+    }
+
+    //appendKinematicStateToHistory();
+    impl->needToAppendKinematicStateToHistory = true;
+    impl->sigKinematicStateEdited.request();
 }
 
 
@@ -600,7 +643,7 @@ bool BodyItemImpl::redoKinematicState()
 }
         
 
-PinDragIKptr BodyItem::pinDragIK()
+std::shared_ptr<PinDragIK> BodyItem::pinDragIK()
 {
     if(!impl->pinDragIK){
         impl->pinDragIK = std::make_shared<PinDragIK>(impl->body);
@@ -609,23 +652,31 @@ PinDragIKptr BodyItem::pinDragIK()
 }
 
 
-InverseKinematicsPtr BodyItem::getCurrentIK(Link* targetLink)
+std::shared_ptr<InverseKinematics> BodyItem::getCurrentIK(Link* targetLink)
 {
-    InverseKinematicsPtr ik;
+    shared_ptr<InverseKinematics> ik;
     impl->getCurrentIK(targetLink, ik);
     return ik;
 }
 
 
-void BodyItemImpl::getCurrentIK(Link* targetLink, InverseKinematicsPtr& ik)
+void BodyItemImpl::getCurrentIK(Link* targetLink, shared_ptr<InverseKinematics>& ik)
 {
-    if(KinematicsBar::instance()->mode() == KinematicsBar::AUTO_MODE){
-        getDefaultIK(targetLink, ik);
+    auto rootLink = body->rootLink();
+    
+    if(attachment && targetLink == rootLink){
+        ik = make_shared<MyCompositeBodyIK>(this);
+    }
+
+    if(!ik){
+        if(KinematicsBar::instance()->mode() == KinematicsBar::AUTO_MODE){
+            getDefaultIK(targetLink, ik);
+        }
     }
 
     if(!ik){
         self->pinDragIK(); // create if not created
-        if(pinDragIK->numPinnedLinks() > 0 || !currentBaseLink){
+        if(pinDragIK->numPinnedLinks() > 0){
             pinDragIK->setTargetLink(targetLink, true);
             if(pinDragIK->initialize()){
                 ik = pinDragIK;
@@ -633,22 +684,21 @@ void BodyItemImpl::getCurrentIK(Link* targetLink, InverseKinematicsPtr& ik)
         }
     }
     if(!ik){
-        if(currentBaseLink){
-            ik = getCustomJointPath(body, currentBaseLink, targetLink);
-        }
+        auto baseLink = currentBaseLink ? currentBaseLink.get() : rootLink;
+        ik = getCustomJointPath(body, baseLink, targetLink);
     }
 }
 
 
-InverseKinematicsPtr BodyItem::getDefaultIK(Link* targetLink)
+std::shared_ptr<InverseKinematics> BodyItem::getDefaultIK(Link* targetLink)
 {
-    InverseKinematicsPtr ik;
+    shared_ptr<InverseKinematics> ik;
     impl->getDefaultIK(targetLink, ik);
     return ik;
 }
 
 
-void BodyItemImpl::getDefaultIK(Link* targetLink, InverseKinematicsPtr& ik)
+void BodyItemImpl::getDefaultIK(Link* targetLink, shared_ptr<InverseKinematics>& ik)
 {
     const Mapping& setupMap = *body->info()->findMapping("defaultIKsetup");
 
@@ -660,7 +710,7 @@ void BodyItemImpl::getDefaultIK(Link* targetLink, InverseKinematicsPtr& ik)
                 if(setup.size() == 1){
                     ik = getCustomJointPath(body, baseLink, targetLink);
                 } else {
-                    CompositeIKPtr compositeIK(new CompositeIK(body, targetLink));
+                    auto compositeIK = make_shared<CompositeIK>(body, targetLink);
                     ik = compositeIK;
                     for(int i=0; i < setup.size(); ++i){
                         Link* baseLink = body->link(setup[i].toString());
@@ -678,15 +728,15 @@ void BodyItemImpl::getDefaultIK(Link* targetLink, InverseKinematicsPtr& ik)
 }
 
 
-PenetrationBlockerPtr BodyItem::createPenetrationBlocker(Link* link, bool excludeSelfCollisions)
+std::shared_ptr<PenetrationBlocker> BodyItem::createPenetrationBlocker(Link* link, bool excludeSelfCollisions)
 {
-    PenetrationBlockerPtr blocker;
+    shared_ptr<PenetrationBlocker> blocker;
     impl->createPenetrationBlocker(link, excludeSelfCollisions, blocker);
     return blocker;
 }
 
 
-void BodyItemImpl::createPenetrationBlocker(Link* link, bool excludeSelfCollisions, PenetrationBlockerPtr& blocker)
+void BodyItemImpl::createPenetrationBlocker(Link* link, bool excludeSelfCollisions, shared_ptr<PenetrationBlocker>& blocker)
 {
     WorldItem* worldItem = self->findOwnerItem<WorldItem>();
     if(worldItem){
@@ -733,7 +783,7 @@ void BodyItemImpl::setPresetPose(BodyItem::PresetPoseID id)
         if(pose.isValid()){
             const int n = std::min(pose.size(), body->numJoints());
             while(jointIndex < n){
-                body->joint(jointIndex)->q() = radian(pose[jointIndex].toDouble());
+                body->joint(jointIndex)->q() = pose[jointIndex].toAngle();
                 jointIndex++;
             }
         }
@@ -834,15 +884,15 @@ bool BodyItemImpl::setStance(double width)
 }
                 
 
-boost::optional<Vector3> BodyItem::getParticularPosition(PositionType position)
+stdx::optional<Vector3> BodyItem::getParticularPosition(PositionType position)
 {
-    boost::optional<Vector3> pos;
+    stdx::optional<Vector3> pos;
     impl->getParticularPosition(position, pos);
     return pos;
 }
 
 
-void BodyItemImpl::getParticularPosition(BodyItem::PositionType position, boost::optional<Vector3>& pos)
+void BodyItemImpl::getParticularPosition(BodyItem::PositionType position, stdx::optional<Vector3>& pos)
 {
     if(position == BodyItem::ZERO_MOMENT_POINT){
         pos = zmp;
@@ -888,28 +938,31 @@ void BodyItem::editZmp(const Vector3& zmp)
 }
 
 
-void BodyItem::notifyKinematicStateChange(bool requestFK, bool requestVelFK, bool requestAccFK)
+void BodyItemImpl::notifyKinematicStateChange(bool requestFK, bool requestVelFK, bool requestAccFK, bool isDirect)
 {
-    if(!impl->isCallingSlotsOnKinematicStateEdited){
-        impl->isCurrentKinematicStateInHistory = false;
+    if(!isCallingSlotsOnKinematicStateEdited){
+        isCurrentKinematicStateInHistory = false;
     }
 
-    if(requestFK){
-        impl->isFkRequested |= requestFK;
-        impl->isVelFkRequested |= requestVelFK;
-        impl->isAccFkRequested |= requestAccFK;
+    updateFlags.reset();
+
+    if(attachment && attachment->isBaseKinematicStateChangedNotificationReqruied){
+        attachment->isBaseKinematicStateChangedNotificationReqruied = false;
+        attachment->baseBodyItem->impl->notifyKinematicStateChange(
+            requestFK, requestVelFK, requestAccFK, isDirect);
+
+    } else {
+        if(requestFK){
+            isFkRequested |= requestFK;
+            isVelFkRequested |= requestVelFK;
+            isAccFkRequested |= requestAccFK;
+        }
+        if(isDirect){
+            sigKinematicStateChanged.emit();
+        } else {
+            sigKinematicStateChanged.request();
+        }
     }
-    impl->updateFlags.reset();
-
-    impl->sigKinematicStateChanged.request();
-}
-
-
-void BodyItem::notifyKinematicStateChange
-(Connection& connectionToBlock, bool requestFK, bool requestVelFK, bool requestAccFK)
-{
-    impl->sigKinematicStateChanged.requestBlocking(connectionToBlock);
-    notifyKinematicStateChange(requestFK, requestVelFK, requestAccFK);
 }
 
 
@@ -926,6 +979,34 @@ void BodyItemImpl::emitSigKinematicStateChanged()
         appendKinematicStateToHistory();
         needToAppendKinematicStateToHistory = false;
     }
+}
+
+
+void BodyItem::notifyKinematicStateChange(bool requestFK, bool requestVelFK, bool requestAccFK)
+{
+    impl->notifyKinematicStateChange(requestFK, requestVelFK,requestAccFK, true);
+}
+
+
+void BodyItem::notifyKinematicStateChange
+(Connection& connectionToBlock, bool requestFK, bool requestVelFK, bool requestAccFK)
+{
+    impl->sigKinematicStateChanged.requestBlocking(connectionToBlock);
+    impl->notifyKinematicStateChange(requestFK, requestVelFK, requestAccFK, true);
+}
+
+
+void BodyItem::notifyKinematicStateChangeLater(bool requestFK, bool requestVelFK, bool requestAccFK)
+{
+    impl->notifyKinematicStateChange(requestFK, requestVelFK,requestAccFK, false);
+}
+
+
+void BodyItem::notifyKinematicStateChangeLater
+(Connection& connectionToBlock, bool requestFK, bool requestVelFK, bool requestAccFK)
+{
+    impl->sigKinematicStateChanged.requestBlocking(connectionToBlock);
+    impl->notifyKinematicStateChange(requestFK, requestVelFK, requestAccFK, false);
 }
 
 
@@ -1004,13 +1085,13 @@ bool BodyItem::isSelfCollisionDetectionEnabled() const
 void BodyItem::clearCollisions()
 {
     collisions_.clear();
-    
+
     for(size_t i=0; i < collisionLinkBitSet_.size(); ++i){
         if(collisionLinkBitSet_[i]){
             collisionsOfLink_[i].clear();
+            collisionLinkBitSet_[i] = false;
         }
     }
-    collisionLinkBitSet_.reset();
 }
 
 
@@ -1032,7 +1113,7 @@ void BodyItemImpl::doAssign(Item* srcItem)
     BodyItem* srcBodyItem = dynamic_cast<BodyItem*>(srcItem);
     if(srcBodyItem){
         // copy the base link property
-        Link* baseLink = 0;
+        Link* baseLink = nullptr;
         Link* srcBaseLink = srcBodyItem->currentBaseLink();
         if(srcBaseLink){
             baseLink = body->link(srcBaseLink->name());
@@ -1062,6 +1143,23 @@ void BodyItemImpl::doAssign(Item* srcItem)
         initialState = srcBodyItem->impl->initialState;
         
         self->notifyKinematicStateChange(true);
+    }
+}
+
+
+void BodyItem::onPositionChanged()
+{
+    auto worldItem = findOwnerItem<WorldItem>();
+    if(!worldItem){
+        clearCollisions();
+    }
+
+    auto ownerBodyItem = findOwnerItem<BodyItem>();
+    if(!impl->attachment || (impl->attachment->baseBodyItem != ownerBodyItem)){
+        impl->clearAttachment();
+        if(ownerBodyItem){
+            impl->tryToAttachToBodyItem(ownerBodyItem);
+        }
     }
 }
 
@@ -1118,6 +1216,165 @@ bool BodyItemImpl::onEditableChanged(bool on)
 }
 
 
+static stdx::optional<AttachmentInfo> readAttachmentInfo(Mapping& node, const Body* body, bool isBase)
+{
+    AttachmentInfo info;
+    if(node.read("category", info.category)){
+        if(isBase){
+            string linkName;
+            if(node.read("link", linkName)){
+                info.link = body->link(linkName);
+                if(!info.link){
+                    return stdx::nullopt;
+                }
+            }
+        } else {
+            info.link = nullptr;
+        }
+        info.T.setIdentity();
+        Vector3 translation;
+        if(read(node, "translation", translation)){
+            info.T.translation() = translation;
+        }
+        AngleAxis rotation;
+        if(read(node, "rotation", rotation)){
+            info.T.linear() = rotation.toRotationMatrix();
+        }
+        return info;
+    }
+    return stdx::nullopt;
+}
+
+
+static vector<AttachmentInfo> readAttachmentBases(const Body* body)
+{
+    vector<AttachmentInfo> infos;
+    auto nodes = body->info()->findListing("attachmentBases");
+    if(nodes->isValid()){
+        infos.reserve(nodes->size());
+        for(auto& node : *nodes){
+            if(node->isMapping()){
+                auto info = readAttachmentInfo(*node->toMapping(), body, true);
+                if(info){
+                    infos.push_back(*info);
+                }
+            }
+        }
+    }
+    return infos;
+}
+
+
+void BodyItemImpl::tryToAttachToBodyItem(BodyItem* bodyItem)
+{
+    bool attached = false;
+    
+    auto node = body->info()->findMapping("attachment");
+    if(node->isValid()){
+        auto attachment = readAttachmentInfo(*node, body, false);
+        if(attachment){
+            auto attachmentBases = readAttachmentBases(bodyItem->body());
+            if(!attachmentBases.empty()){
+                for(auto& base : attachmentBases){
+                    if(base.category == (*attachment).category){
+                        if(attachToBodyItem(bodyItem, base, *attachment)){
+                            attached = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if(!attached){
+        mvout() << format(_("{0} cannot be attached to {1}."),
+                          self->name(), bodyItem->name()) << endl;
+    }
+}
+
+
+bool BodyItemImpl::attachToBodyItem
+(BodyItem* bodyItem, const AttachmentInfo& baseInfo, const AttachmentInfo& info)
+{
+    attachment.reset(new Attachment);
+    
+    attachment->baseBodyItem = bodyItem;
+    attachment->baseLink = baseInfo.link;
+    attachment->T_base_local = baseInfo.T;
+    attachment->T_local = info.T;
+    attachment->isBaseKinematicStateChangedNotificationReqruied = false;
+    attachment->category = info.category;
+
+    mvout() << format(_("{0} has been attached to {1} of {2}."),
+                      self->name(), baseInfo.link->name(), bodyItem->name()) << endl;
+
+    attachment->connection =
+        bodyItem->sigKinematicStateChanged().connect(
+            [&](){ onBaseBodyKinematicStateChanged(); });
+
+    onBaseBodyKinematicStateChanged();
+
+    return true;
+}
+
+
+void BodyItemImpl::clearAttachment()
+{
+    if(attachment){
+        auto baseLink = attachment->baseLink;
+        if(baseLink){
+            mvout() << format(_("{0} has been detached from {1} of {2}."),
+                              self->name(), baseLink->name(), baseLink->body()->name()) << endl;
+        }
+        attachment.reset();
+    }
+}
+
+
+void BodyItemImpl::onBaseBodyKinematicStateChanged()
+{
+    Position T_base = attachment->baseLink->T() * attachment->T_base_local;
+    body->rootLink()->T() = T_base * attachment->T_local.inverse(Eigen::Isometry);
+    attachment->isBaseKinematicStateChangedNotificationReqruied = false;
+
+    //! \todo requestVelFK and requestAccFK should be set appropriately
+    notifyKinematicStateChange(true, false, false, true);
+}
+
+
+MyCompositeBodyIK::MyCompositeBodyIK(BodyItemImpl* bodyItemImpl)
+    : bodyItemImpl(bodyItemImpl),
+      attachment(bodyItemImpl->attachment)
+{
+    baseIK = attachment->baseBodyItem->getCurrentIK(attachment->baseLink);
+}
+
+
+bool MyCompositeBodyIK::calcInverseKinematics(const Position& T)
+{
+    bool result = false;
+    if(baseIK){
+        if(!attachment){
+            baseIK.reset();
+        } else {
+            Position Ta = T * attachment->T_local * attachment->T_base_local.inverse(Eigen::Isometry);
+            result = baseIK->calcInverseKinematics(Ta);
+            if(result){
+                attachment->isBaseKinematicStateChangedNotificationReqruied = true;
+            }
+        }
+    }
+    return result;
+}
+
+
+std::shared_ptr<InverseKinematics> MyCompositeBodyIK::getParentBodyIK()
+{
+    return baseIK;
+}
+
+
 void BodyItem::doPutProperties(PutPropertyFunction& putProperty)
 {
     impl->doPutProperties(putProperty);
@@ -1134,12 +1391,13 @@ void BodyItemImpl::doPutProperties(PutPropertyFunction& putProperty)
     putProperty(_("Base link"), currentBaseLink ? currentBaseLink->name() : "none");
     putProperty.decimals(3)(_("Mass"), body->mass());
     putProperty(_("Static model"), body->isStaticModel(),
-                (std::bind(&BodyItemImpl::onStaticModelPropertyChanged, this, _1)));
+                [&](bool on){ return onStaticModelPropertyChanged(on); });
     putProperty(_("Collision detection"), isCollisionDetectionEnabled,
-                (std::bind(&BodyItemImpl::enableCollisionDetection, this, _1)));
+                [&](bool on){ return enableCollisionDetection(on); });
     putProperty(_("Self-collision detection"), isSelfCollisionDetectionEnabled,
-                (std::bind(&BodyItemImpl::enableSelfCollisionDetection, this, _1)));
-    putProperty(_("Editable"), isEditable, std::bind(&BodyItemImpl::onEditableChanged, this, _1));
+                [&](bool on){ return enableSelfCollisionDetection(on); });
+    putProperty(_("Editable"), isEditable,
+                [&](bool on){ return onEditableChanged(on); });
 }
 
 
@@ -1201,96 +1459,85 @@ bool BodyItem::restore(const Archive& archive)
 
 bool BodyItemImpl::restore(const Archive& archive)
 {
-    bool restored = false;
+    if(!archive.loadItemFile(self, "modelFile")){
+        return false;
+    }
+
+    Vector3 p = Vector3::Zero();
+    Matrix3 R = Matrix3::Identity();
+        
+    if(read(archive, "rootPosition", p)){
+        body->rootLink()->p() = p;
+    }
+    if(read(archive, "rootAttitude", R)){
+        body->rootLink()->R() = R;
+    }
+    Listing* qs = archive.findListing("jointPositions");
+    if(qs->isValid()){
+        int nj = body->numAllJoints();
+        if(qs->size() != nj){
+            if(qs->size() != body->numJoints()){
+                MessageView::instance()->putln(
+                    format(_("Mismatched size of the stored joint positions for {}"), self->name()),
+                    MessageView::WARNING);
+            }
+            nj = std::min(qs->size(), nj);
+        }
+        for(int i=0; i < nj; ++i){
+            body->joint(i)->q() = (*qs)[i].toDouble();
+        }
+    }
+
+    //! \todo replace the following code with the ValueTree serialization function of BodyState
+    initialState.clear();
+
+    read(archive, "initialRootPosition", p);
+    read(archive, "initialRootAttitude", R);
+    initialState.setRootLinkPosition(SE3(p, R));
     
-    string modelFile;
-    /*
-      if(archive.readRelocatablePath("modelFile", modelFile)){
-      restored = modelFile.empty() || load(modelFile);
-      }
-    */
-    if(archive.readRelocatablePath("modelFile", modelFile)){
-        restored = self->load(modelFile);
+    qs = archive.findListing("initialJointPositions");
+    if(qs->isValid()){
+        BodyState::Data& q = initialState.data(BodyState::JOINT_POSITIONS);
+        int n = body->numAllJoints();
+        int m = qs->size();
+        if(m != n){
+            if(m != body->numJoints()){
+                MessageView::instance()->putln(
+                    format(_("Mismatched size of the stored initial joint positions for {}"), self->name()),
+                    MessageView::WARNING);
+            }
+            m = std::min(m, n);
+        }
+        q.resize(n);
+        for(int i=0; i < m; ++i){
+            q[i] = (*qs)[i].toDouble();
+        }
+        for(int i=m; i < n; ++i){
+            q[i] = body->joint(i)->q();
+        }
     }
 
-    if(restored){
-
-        Vector3 p = Vector3::Zero();
-        Matrix3 R = Matrix3::Identity();
+    read(archive, "zmp", zmp);
         
-        if(read(archive, "rootPosition", p)){
-            body->rootLink()->p() = p;
-        }
-        if(read(archive, "rootAttitude", R)){
-            body->rootLink()->R() = R;
-        }
-        Listing* qs = archive.findListing("jointPositions");
-        if(qs->isValid()){
-            int nj = body->numAllJoints();
-            if(qs->size() != nj){
-                if(qs->size() != body->numJoints()){
-                    MessageView::instance()->putln(
-                        format("Mismatched size of the stored joint positions for %1%") % self->name(),
-                        MessageView::WARNING);
-                }
-                nj = std::min(qs->size(), nj);
-            }
-            for(int i=0; i < nj; ++i){
-                body->joint(i)->q() = (*qs)[i].toDouble();
-            }
-        }
+    body->calcForwardKinematics();
+    setCurrentBaseLink(body->link(archive.get("currentBaseLink", "")));
 
-        //! \todo replace the following code with the ValueTree serialization function of BodyState
-        initialState.clear();
-
-        read(archive, "initialRootPosition", p);
-        read(archive, "initialRootAttitude", R);
-        initialState.setRootLinkPosition(SE3(p, R));
-
-        qs = archive.findListing("initialJointPositions");
-        if(qs->isValid()){
-            BodyState::Data& q = initialState.data(BodyState::JOINT_POSITIONS);
-            int n = body->numAllJoints();
-            int m = qs->size();
-            if(m != n){
-                if(m != body->numJoints()){
-                    MessageView::instance()->putln(
-                        format("Mismatched size of the stored initial joint positions for %1%") % self->name(),
-                        MessageView::WARNING);
-                }
-                m = std::min(m, n);
-            }
-            q.resize(n);
-            for(int i=0; i < m; ++i){
-                q[i] = (*qs)[i].toDouble();
-            }
-            for(int i=m; i < n; ++i){
-                q[i] = body->joint(i)->q();
-            }
-        }
-
-        read(archive, "zmp", zmp);
-        
-        body->calcForwardKinematics();
-        setCurrentBaseLink(body->link(archive.get("currentBaseLink", "")));
-
-        bool staticModel;
-        if(archive.read("staticModel", staticModel)){
-            onStaticModelPropertyChanged(staticModel);
-        }
-
-        bool on;
-        if(archive.read("collisionDetection", on)){
-            enableCollisionDetection(on);
-        }
-        if(archive.read("selfCollisionDetection", on)){
-            enableSelfCollisionDetection(on);
-        }
-
-        archive.read("isEditable", isEditable);
-
-        self->notifyKinematicStateChange();
+    bool staticModel;
+    if(archive.read("staticModel", staticModel)){
+        onStaticModelPropertyChanged(staticModel);
     }
 
-    return restored;
+    bool on;
+    if(archive.read("collisionDetection", on)){
+        enableCollisionDetection(on);
+    }
+    if(archive.read("selfCollisionDetection", on)){
+        enableSelfCollisionDetection(on);
+    }
+
+    archive.read("isEditable", isEditable);
+
+    self->notifyKinematicStateChange();
+
+    return true;
 }
