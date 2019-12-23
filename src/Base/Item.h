@@ -55,7 +55,6 @@ public:
     bool addSubItem(Item* item);
     bool isSubItem() const;
     void detachFromParentItem();
-    void emitSigDetachedFromRootForSubTree();
     bool insertChildItem(Item* item, Item* nextItem, bool isManualOperation = false);
     bool insertSubItem(Item* item, Item* nextItem);
 
@@ -65,6 +64,7 @@ public:
     static Item* rootItem();
     RootItem* findRootItem() const;
     bool isConnectedToRoot() const;
+    Item* getLocalRootItem() const;
 
     /**
        Find an item that has the corresponding path to it in the sub tree
@@ -106,8 +106,8 @@ public:
 
     Item* headItem() const;
 
-    template <class ItemType> ItemType* findOwnerItem(bool includeSelf = false) {
-        Item* parentItem__ = includeSelf ? this : parentItem();
+    template <class ItemType> ItemType* findOwnerItem(bool includeSelf = false) const {
+        Item* parentItem__ = includeSelf ? const_cast<Item*>(this) : parentItem();
         while(parentItem__){
             ItemType* ownerItem = dynamic_cast<ItemType*>(parentItem__);
             if(ownerItem){
@@ -115,7 +115,7 @@ public:
             }
             parentItem__ = parentItem__->parentItem();
         }
-        return 0;
+        return nullptr;
     }
 
     bool isOwnedBy(Item* item) const;
@@ -189,14 +189,14 @@ public:
        @note deprecated
     */
     SignalProxy<void()> sigDetachedFromRoot() {
-        return sigDetachedFromRoot_;
+        return sigDisconnectedFromRoot_;
     }
 
     /**
        @note Please use this instead of sigDetachedFromRoot()
     */
     SignalProxy<void()> sigDisconnectedFromRoot() {
-        return sigDetachedFromRoot_;
+        return sigDisconnectedFromRoot_;
     }
 
     SignalProxy<void()> sigSubTreeChanged() {
@@ -238,7 +238,7 @@ private:
     std::bitset<NUM_ATTRIBUTES> attributes;
 
     Signal<void(const std::string& oldName)> sigNameChanged_;
-    Signal<void()> sigDetachedFromRoot_;
+    Signal<void()> sigDisconnectedFromRoot_;
     Signal<void()> sigUpdated_;
     Signal<void()> sigPositionChanged_;
     Signal<void()> sigSubTreeChanged_;
@@ -257,6 +257,7 @@ private:
     void callSlotsOnPositionChanged();
     void callFuncOnConnectedToRoot();
     void addToItemsToEmitSigSubTreeChanged();
+    void emitSigDisconnectedFromRootForSubTree();
     static void emitSigSubTreeChanged();
 
     void detachFromParentItemSub(bool isMoving);

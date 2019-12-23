@@ -17,6 +17,7 @@
 #include <QBoxLayout>
 #include <QMouseEvent>
 #include <QHeaderView>
+#include <QModelIndex>
 #include <set>
 #include <unordered_map>
 #include "gettext.h"
@@ -26,7 +27,7 @@ using namespace cnoid;
 
 namespace {
 
-ItemTreeView* itemTreeView = 0;
+ItemTreeView* itemTreeView = nullptr;
 
 typedef Signal<void(bool isChecked)> SigCheckToggled;
 typedef std::shared_ptr<SigCheckToggled> SigCheckToggledPtr;
@@ -43,8 +44,8 @@ public:
 
     ItvItem(Item* item, ItemTreeViewImpl* itemTreeViewImpl);
     virtual ~ItvItem();
-    virtual QVariant data(int column, int role) const;
-    virtual void setData(int column, int role, const QVariant& value);
+    virtual QVariant data(int column, int role) const override;
+    virtual void setData(int column, int role, const QVariant& value) override;
     SigCheckToggled* sigCheckToggled(int id);
     SigCheckToggled& getOrCreateSigCheckToggled(int id);
 };
@@ -75,7 +76,7 @@ public:
 
     unordered_map<Item*, ItvItem*> itemToItvItemMap;
 
-    int isProceccingSlotForRootItemSignals;
+    int isProcessingSlotForRootItemSignals;
     ScopedConnectionSet connectionsFromRootItem;
     set<Item*> itemsBeingOperated;
 
@@ -106,8 +107,8 @@ public:
     void showCheckColumn(int id, bool on);
     void releaseCheckColumn(int id);
         
-    virtual void mousePressEvent(QMouseEvent* event);
-    virtual void keyPressEvent(QKeyEvent* event);
+    virtual void mousePressEvent(QMouseEvent* event) override;
+    virtual void keyPressEvent(QKeyEvent* event) override;
         
     ItvItem* getItvItem(Item* item);
     ItvItem* getOrCreateItvItem(Item* item);
@@ -117,11 +118,11 @@ public:
     void onSubTreeRemoved(Item* item, bool isMoving);
     void onItemAssigned(Item* assigned, Item* srcItem);
 
-    virtual void dropEvent(QDropEvent* event);
+    virtual void dropEvent(QDropEvent* event) override;
         
     void onRowsAboutToBeRemoved(const QModelIndex& parent, int start, int end);
     void onRowsInserted(const QModelIndex& parent, int start, int end);
-    virtual bool dropMimeData(QTreeWidgetItem* parent, int index, const QMimeData* data, Qt::DropAction action);
+    virtual bool dropMimeData(QTreeWidgetItem* parent, int index, const QMimeData* data, Qt::DropAction action) override;
     void onSelectionChanged();
     bool isItemSelected(Item* item);
     bool selectItem(Item* item, bool select);
@@ -282,22 +283,10 @@ ItemTreeView* ItemTreeView::mainInstance()
 
 ItemTreeView::ItemTreeView()
 {
-    construct(RootItem::instance());
-}
-
-
-ItemTreeView::ItemTreeView(RootItem* rootItem)
-{
-    construct(rootItem);
-}
-
-
-void ItemTreeView::construct(RootItem* rootItem)
-{
     setDefaultLayoutArea(View::LEFT);
     setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     
-    impl = new ItemTreeViewImpl(this, rootItem);
+    impl = new ItemTreeViewImpl(this, RootItem::instance());
 
     QVBoxLayout* layout = new QVBoxLayout();
     layout->addWidget(impl);
@@ -310,7 +299,7 @@ ItemTreeViewImpl::ItemTreeViewImpl(ItemTreeView* self, RootItem* rootItem)
       rootItem(rootItem),
       projectManager(ProjectManager::instance())
 {
-    isProceccingSlotForRootItemSignals = 0;
+    isProcessingSlotForRootItemSignals = 0;
     isDropping = false;
     
     setColumnCount(1);
@@ -341,10 +330,12 @@ ItemTreeViewImpl::ItemTreeViewImpl(ItemTreeView* self, RootItem* rootItem)
     connectionsFromRootItem.add(
         rootItem->sigItemAssigned().connect([&](Item* assigned, Item* srcItem){ onItemAssigned(assigned, srcItem); }));
 
-    QObject::connect(model(), SIGNAL(rowsAboutToBeRemoved(const QModelIndex&, int, int)),
-                     self, SLOT(onRowsAboutToBeRemoved(const QModelIndex&, int, int)));
-    QObject::connect(model(), SIGNAL(rowsInserted(const QModelIndex&, int, int)),
-                     self, SLOT(onRowsInserted(const QModelIndex&, int, int)));
+    sigRowsAboutToBeRemoved().connect(
+        [&](const QModelIndex& parent, int start, int end){
+            onRowsAboutToBeRemoved(parent, start, end); });
+    sigRowsInserted().connect(
+        [&](const QModelIndex& parent, int start, int end){
+            onRowsInserted(parent, start, end);  });
 
     popupMenu = new Menu(this);
     menuManager.setTopMenu(popupMenu);
@@ -396,6 +387,12 @@ ItemTreeView::~ItemTreeView()
 ItemTreeViewImpl::~ItemTreeViewImpl()
 {
 
+}
+
+
+Item* ItemTreeView::rootItem()
+{
+    return impl->rootItem;
 }
 
 
@@ -506,14 +503,19 @@ void ItemTreeViewImpl::releaseCheckColumn(int id)
 }
 
 
-RootItem* ItemTreeView::rootItem()
-{
-    return impl->rootItem;
-}
-
-
 void ItemTreeViewImpl::mousePressEvent(QMouseEvent* event)
 {
+    // Emit sigSelectionChanged when clicking on an already selected item
+    if(event->button() == Qt::LeftButton){
+        if(selectedItemList.size() == 1){
+            if(auto itvItem = dynamic_cast<ItvItem*>(itemAt(event->pos()))){
+                if(itvItem->item == selectedItemList.front()){
+                    sigSelectionChanged(selectedItemList);
+                }
+            }
+        }
+    }
+    
     TreeWidget::mousePressEvent(event);
 
     if(event->button() == Qt::RightButton){
@@ -568,7 +570,7 @@ void ItemTreeViewImpl::keyPressEvent(QKeyEvent* event)
 
 ItvItem* ItemTreeViewImpl::getItvItem(Item* item)
 {
-    ItvItem* itvItem = 0;
+    ItvItem* itvItem = nullptr;
     auto iter = itemToItvItemMap.find(item);
     if(iter != itemToItvItemMap.end()){
         itvItem = iter->second;
@@ -599,7 +601,7 @@ void ItemTreeViewImpl::onSubTreeAddedOrMoved(Item* item)
         return;
     }
     
-    isProceccingSlotForRootItemSignals++;
+    isProcessingSlotForRootItemSignals++;
     
     Item* parentItem = item->parentItem();
     if(parentItem){
@@ -613,7 +615,7 @@ void ItemTreeViewImpl::onSubTreeAddedOrMoved(Item* item)
         }
     }
 
-    isProceccingSlotForRootItemSignals--;
+    isProcessingSlotForRootItemSignals--;
 }
 
 
@@ -651,7 +653,7 @@ void ItemTreeViewImpl::onSubTreeRemoved(Item* item, bool isMoving)
         return;
     }
     
-    isProceccingSlotForRootItemSignals++;
+    isProcessingSlotForRootItemSignals++;
     
     ItvItem* itvItem = getItvItem(item);
     if(itvItem){
@@ -664,7 +666,7 @@ void ItemTreeViewImpl::onSubTreeRemoved(Item* item, bool isMoving)
         delete itvItem;
     }
 
-    isProceccingSlotForRootItemSignals--;
+    isProcessingSlotForRootItemSignals--;
 }
 
 
@@ -676,16 +678,12 @@ void ItemTreeViewImpl::dropEvent(QDropEvent* event)
 }
     
 
-void ItemTreeView::onRowsAboutToBeRemoved(const QModelIndex& parent, int start, int end)
-{
-    if(impl->isProceccingSlotForRootItemSignals == 0){
-        impl->onRowsAboutToBeRemoved(parent, start, end);
-    }
-}
-
-
 void ItemTreeViewImpl::onRowsAboutToBeRemoved(const QModelIndex& parent, int start, int end)
 {
+    if(isProcessingSlotForRootItemSignals){
+        return;
+    }
+
     QTreeWidgetItem* parentTwItem = itemFromIndex(parent);
     if(!parentTwItem){
         parentTwItem = invisibleRootItem();
@@ -714,16 +712,12 @@ void ItemTreeViewImpl::onRowsAboutToBeRemoved(const QModelIndex& parent, int sta
 }
 
 
-void ItemTreeView::onRowsInserted(const QModelIndex& parent, int start, int end)
-{
-    if(impl->isProceccingSlotForRootItemSignals == 0){
-        impl->onRowsInserted(parent, start, end);
-    }
-}
-
-
 void ItemTreeViewImpl::onRowsInserted(const QModelIndex& parent, int start, int end)
 {
+    if(isProcessingSlotForRootItemSignals){
+        return;
+    }
+    
     QTreeWidgetItem* parentTwItem = itemFromIndex(parent);
     if(parentTwItem){
         parentTwItem->setExpanded(true);
